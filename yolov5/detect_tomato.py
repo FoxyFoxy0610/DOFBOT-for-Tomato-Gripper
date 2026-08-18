@@ -6,8 +6,10 @@ import time
 import os
 from Arm_Lib import Arm_Device
 
-# Shrinking with the same ratio + padding
 def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
+    """
+    Resize image to a 32-pixel-multiple rectangle, preserving aspect ratio with padding.
+    """
     shape = im.shape[:2]  # height, width
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
@@ -24,23 +26,36 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
 
 
 class TomatoTracker:
-    def __init__(self, track_num, servo_1_init = 90):
+    def __init__(self, track_num, servo_1_init=90):
+        """
+        Initialize the YOLOv5 tomato tracker and robot arm control.
+        
+        Args:
+            track_num: 1 for first view, 2 for second view (used for triangulation)
+            servo_1_init: Initial angle for the base servo (defaults to 90)
+        """
         self.track_num = track_num
+        
+        # Load YOLOv5 TorchScript model
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         WEIGHT_PATH = os.path.join(BASE_DIR, 'weights', 'yolov5n_tomato.torchscript')
         self.model = torch.jit.load(WEIGHT_PATH).eval().to('cuda')
         self.img_tensor_gpu = torch.empty((1, 3, 640, 640), dtype=torch.float32, device='cuda')
 
+        # Initialize Camera
         self.cap = cv2.VideoCapture(0)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
         self.class_names = ['Green', 'Turning', 'Harvest']
 
+        # Initialize DOFBOT Arm
         self.Arm = Arm_Device()
         time.sleep(0.5)
         
-        self.angles_initial = [[90, 158, 0, 5, 90, 90],[90, 105, 30, 15, 90, 90]]
+        # Predefined initial poses for two tracking stages
+        # Format: [Servo1, Servo2, Servo3, Servo4, Servo5, Servo6]
+        self.angles_initial = [[90, 158, 0, 5, 90, 90], [90, 105, 30, 15, 90, 90]]
 
         if track_num == 1:
             self.servo_angle_1 = self.angles_initial[0][0]
@@ -59,12 +74,15 @@ class TomatoTracker:
         time.sleep(1)
 
     def run(self):
+        """
+        Capture a frame, perform YOLOv5 inference, and return detection results.
+        """
         start = time.time()
         ret, frame = self.cap.read()
         if not ret:
             return None
 
-        # Preprocessing
+        # Preprocessing for YOLO
         img, ratio, (dw, dh) = letterbox(frame, new_shape=(640, 640))
         img_rgb = img[:, :, ::-1]
         img_tensor = img_rgb.transpose(2, 0, 1)
@@ -76,10 +94,10 @@ class TomatoTracker:
         with torch.no_grad():
             pred = self.model(self.img_tensor_gpu)[0]
 
-        # NMS
+        # Non-Maximum Suppression (NMS)
         pred = non_max_suppression(pred, conf_thres=0.9, iou_thres=0.5)[0]
 
-        # Draw boxes
+        # Draw bounding boxes and labels on the frame
         if pred is not None:
             for *box, conf, cls in pred.cpu().numpy():
                 x1, y1, x2, y2 = box
@@ -98,6 +116,15 @@ class TomatoTracker:
         return pred
 
     def tracking(self, x1, x2, y1, y2):
+        """
+        PID Control to align the camera with the detected tomato.
+        
+        Args:
+            x1, x2, y1, y2: Bounding box coordinates of the detected tomato.
+        Returns:
+            coordinate list if tomato is centered, else None
+        """
+        # Calculate the center of the bounding box
         center_x = (x1 + x2) / 2
         center_y = (2 * y1 + y2) / 3
         if self.track_num == 2:
@@ -106,49 +133,50 @@ class TomatoTracker:
         image_center = 320
         threshold = 20
 
+        # Calculate deviation from the center
         offset_x = center_x - image_center
         offset_y = center_y - image_center
+        
         Kp = 0.005
-        Kp_2 = 0.005
         max_step = 1
 
+        # If the tomato is within the center threshold, lock the coordinates
         if abs(offset_x) < threshold and abs(offset_y) < threshold:
             coordinate = self.angles_initial[self.track_num-1] + [(x2-x1)]
             coordinate[0] = int(self.servo_angle_1)
             coordinate[1] = int(self.servo_angle_2)
             coordinate[2] = int(self.servo_angle_3)
             coordinate[3] = int(self.servo_angle_4)
-
         else:
             coordinate = None
 
+        # PID Proportional control to adjust servo angles smoothly
         delta_angle_x = np.clip(offset_x * Kp, -max_step, max_step)
         delta_angle_y = np.clip(offset_y * Kp, -max_step, max_step)
-        # delta_angle_y_2 = np.clip(offset_y * Kp_2, -max_step, max_step)
 
         new_angle_x = np.clip(self.servo_angle_1 - delta_angle_x, 0, 180)
-        # new_angle_y_2 = np.clip(self.servo_angle_2 - delta_angle_y_2, 0, 180)
         new_angle_y_4 = np.clip(self.servo_angle_4 - delta_angle_y, 0, 180)
         
-
         offset_thre = 0.1
+        
+        # Write to servos if angle change is significant
         if abs(new_angle_x - self.servo_angle_1) >= offset_thre:
             self.servo_angle_1 = new_angle_x
             self.Arm.Arm_serial_servo_write(1, self.servo_angle_1, 500)
             time.sleep(0.05)
         
         if abs(new_angle_y_4 - self.servo_angle_4) >= offset_thre:
-            # self.servo_angle_2 = new_angle_y_2
             self.servo_angle_4 = new_angle_y_4
-            # self.Arm.Arm_serial_servo_write(2, self.servo_angle_2, 500)
             self.Arm.Arm_serial_servo_write(4, self.servo_angle_4, 500)
             time.sleep(0.05)
         
-        print(self.servo_angle_1, self.servo_angle_2, self.servo_angle_3, self.servo_angle_4, end='\r')
+        print(f"Current Servos: {self.servo_angle_1:.1f}, {self.servo_angle_2:.1f}, {self.servo_angle_3:.1f}, {self.servo_angle_4:.1f}", end='\r')
     
         return coordinate
         
-
     def release(self):
+        """
+        Release camera resources.
+        """
         self.cap.release()
         cv2.destroyAllWindows()
